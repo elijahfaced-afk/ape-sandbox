@@ -2577,9 +2577,9 @@ const hats = {
     if (box.isEmpty()) return null;
     const size = box.getSize(new V3()), c = box.getCenter(new V3());
     const holder = new THREE.Group(); holder.name = 'hatHolder';
-    holder.position.set(c.x, box.max.y - size.y * 0.3, c.z);          // sunk onto the head
+    holder.position.set(c.x, box.max.y - size.y * 0.22, c.z);         // sunk onto the head, clear of the eyes
     holder.rotation.set(0, Math.atan2(front.x, front.z), 0);
-    holder.scale.setScalar(Math.max(size.x, size.z) * 1.25);
+    holder.scale.setScalar(Math.max(size.x, size.z) * 1.2);
     scene.add(holder); holder.updateMatrixWorld(true);
     headBone.attach(holder);
     const w = { holder };
