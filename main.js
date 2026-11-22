@@ -1302,6 +1302,7 @@ function makeKiller(def) {
     body: null, stuckT: 0, sideT: 0, sideDir: 1, yaw: 0,
     kill: null, alerted: false, cuesFired: new Set(),
     walkSpeed: 3.2, chaseSpeed: 7.6, accel: 8, killRange: 1.6, bodySpheres: [[0.5, 0.5], [0.5, 1.4]], eyeHeight: 1.8,
+    seeRange: 24,      // spots you this far away (in metres, with a clear line of sight); loses you 21 m further out
     killCues: [],
     sounds: Object.fromEntries(Object.entries(def.soundFiles).map(([k, f]) => [k, new Audio(f)])),
 
@@ -1445,12 +1446,12 @@ function makeKiller(def) {
         const canReach = !player.dead && !shop.isSafe();
         if (canReach) {
           // it spots you: sound, then sprint
-          const sees = dist < 24 && this.canSee();
+          const sees = dist < this.seeRange && this.canSee();
           if (!this.alerted && (sees || this.alwaysKnows)) {
             this.alerted = true;
-            this.playSound('spotted', 1 - dist / 40);
+            this.playSound('spotted', Math.max(0.2, 1 - dist / 40));   // still heard when it spots you from far off
             this.onSpot?.();
-          } else if (this.alerted && dist > 45 && !this.alwaysKnows) this.alerted = false;
+          } else if (this.alerted && dist > this.seeRange + 21 && !this.alwaysKnows) this.alerted = false;
           speed = this.alerted ? this.chaseSpeed : this.walkSpeed;
           dir.copy(this.steer(p, dt, sees && dist < 7 && Math.abs(p.y - b.position.y) < 1));
         } else {
@@ -1548,6 +1549,7 @@ function makeKiller(def) {
 // ---- 1. Saw Runner: Walk/Run animations, kill scene with a camera in the victim's head
 const sawRunner = makeKiller({
   name: 'Saw Runner',
+  seeRange: 60,
   soundFiles: { spotted: 'assets/sounds/spotted.mp3', kill: 'assets/sounds/kill.mp3' },
   buzz: null,
   async load() {
@@ -1741,6 +1743,7 @@ const blood = {
 
 const bladeApe = makeKiller({
   name: 'Blade Ape',
+  seeRange: 81,
   soundFiles: { spotted: 'assets/sounds/blade_scream.mp3', splatter: 'assets/sounds/blade_splatter.mp3', death: 'assets/sounds/blade_death.mp3' },
   walkSpeed: 14, chaseSpeed: 30, accel: 20, killRange: 2.2, eyeHeight: 1.4,
   bodySpheres: [[0.5, 0.5], [0.5, 1.2]],
