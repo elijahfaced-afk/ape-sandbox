@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
 import * as CANNON from 'cannon-es';
 import { computeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
 
@@ -15,7 +16,12 @@ const _v1 = new V3(), _v2 = new V3(), _v3 = new V3(), _q1 = new Q(), _q2 = new Q
 
 // ---------------------------------------------------------------- renderer / scene
 const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+// phones and tablets: touch controls (see the touch module) and a lighter picture
+// (?touch in the address forces them on, e.g. for a touch-screen laptop)
+const IS_TOUCH = (matchMedia('(pointer: coarse)').matches && !matchMedia('(pointer: fine)').matches) || new URLSearchParams(location.search).has('touch');
+renderer.setPixelRatio(Math.min(devicePixelRatio, IS_TOUCH ? 1.25 : 2));
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');
 renderer.setSize(innerWidth, innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -28,11 +34,15 @@ scene.background = new THREE.Color('#9cc9f0');
 scene.fog = new THREE.Fog('#9cc9f0', 80, 260);
 const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 600);
 camera.rotation.order = 'YXZ';
+// In VR the headset moves the camera inside this rig, and the rig is put where the game wants your eyes.
+// Outside VR it stays at the origin, so the camera's own position is its world position.
+const xrRig = new THREE.Group();
+xrRig.add(camera); scene.add(xrRig);
 
 const hemi = new THREE.HemisphereLight('#f4f0ff', '#6a6050', 1.7); scene.add(hemi);   // strong ambient: we're mostly indoors
 const sun = new THREE.DirectionalLight('#fff4e0', 2.2);
 sun.castShadow = true;
-sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.mapSize.set(IS_TOUCH ? 1024 : 2048, IS_TOUCH ? 1024 : 2048);
 Object.assign(sun.shadow.camera, { left: -45, right: 45, top: 45, bottom: -45, near: 1, far: 200 });
 sun.shadow.bias = -0.0005;
 scene.add(sun, sun.target);
@@ -510,12 +520,12 @@ function updatePlayer(dt) {
   if (!menuOpen) {
     if (keys.KeyW) wish.add(fwd); if (keys.KeyS) wish.sub(fwd);
     if (keys.KeyD) wish.add(right); if (keys.KeyA) wish.sub(right);
-    if (pad.move.lengthSq()) wish.addScaledVector(fwd, pad.move.y).addScaledVector(right, pad.move.x);
+    for (const m of [pad.move, touch.move, vr.move]) if (m.lengthSq()) wish.addScaledVector(fwd, m.y).addScaledVector(right, m.x);
   }
   if (!mapReady) { b.position.copy(SPAWN); b.velocity.set(0, 0, 0); return; }   // nothing to stand on yet
   if (player.dead) { b.velocity.set(0, Math.min(b.velocity.y, 0), 0); player.speed = 0; return; }
-  if (wish.lengthSq()) wish.normalize();
-  const run = keys.ShiftLeft || keys.ShiftRight;
+  if (wish.lengthSq() > 1) wish.normalize();     // a half-pushed stick walks slower
+  const run = keys.ShiftLeft || keys.ShiftRight || touch.run;
   player.grounded = groundCheck();
   const speed = run ? 9 : 4.5;
   const accel = player.grounded ? 14 : 3;
@@ -976,6 +986,7 @@ const canvas = renderer.domElement;
 let unlockedPlay = false;
 function lockPointer() {
   if (unlockedPlay) return;
+  if (IS_TOUCH) return startUnlocked();     // no mouse to lock: the touch controls steer instead
   try {
     const r = canvas.requestPointerLock();
     if (r && r.catch) r.catch(() => startUnlocked());
@@ -984,7 +995,7 @@ function lockPointer() {
 function startUnlocked() {
   unlockedPlay = locked = true;
   $('start').style.display = 'none';
-  toast('Pointer lock unavailable: mouse look follows the cursor');
+  if (!IS_TOUCH && !vr.on) toast('Pointer lock unavailable: mouse look follows the cursor');
 }
 canvas.addEventListener('click', () => { if (!locked && !menuOpen) lockPointer(); });
 $('start').addEventListener('click', lockPointer);
@@ -1101,6 +1112,153 @@ const pad = {
 };
 addEventListener('gamepadconnected', () => toast('Controller connected'));
 $('start').addEventListener('click', () => pad.takeOver());
+
+// ---------------------------------------------------------------- phone / tablet (touch)
+// A stick on the left moves, dragging anywhere else looks, and buttons on the right do the rest.
+// The buttons press the same keys / tool clicks as the keyboard and mouse.
+const touch = {
+  on: IS_TOUCH, move: new THREE.Vector2(), run: false,
+  stickId: null, stickC: { x: 0, y: 0 }, lookId: null, lookAt: { x: 0, y: 0 },
+  build() {
+    if (!this.on) return;
+    document.body.classList.add('touch');
+    const ui = document.createElement('div'); ui.id = 'touchUI'; document.body.appendChild(ui);
+    ui.innerHTML = `<div id="tStick"><div id="tKnob"></div></div>` +
+      [['tUse', 'USE'], ['tJump', 'JUMP'], ['tFreeze', 'FREEZE'], ['tRun', 'RUN'], ['tTool', 'TOOL'], ['tTalk', 'E'], ['tMenu', 'MENU'], ['tView', 'VIEW']]
+        .map(([id, t]) => `<button id="${id}" class="tBtn">${t}</button>`).join('');
+    const stick = $('tStick'), knob = $('tKnob');
+    stick.addEventListener('pointerdown', e => {
+      this.stickId = e.pointerId;
+      try { stick.setPointerCapture(e.pointerId); } catch {}     // keep the stick if the finger slides off it
+      const r = stick.getBoundingClientRect(); this.stickC = { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      this.stickMove(e, knob); footsteps.unlock(); audio();
+    });
+    stick.addEventListener('pointermove', e => { if (e.pointerId === this.stickId) this.stickMove(e, knob); });
+    const stickUp = e => { if (e.pointerId !== this.stickId) return; this.stickId = null; this.move.set(0, 0); knob.style.transform = ''; };
+    stick.addEventListener('pointerup', stickUp); stick.addEventListener('pointercancel', stickUp);
+    // look: drag on the game view
+    canvas.addEventListener('pointerdown', e => {
+      if (e.pointerType !== 'touch' || this.lookId !== null) return;
+      e.preventDefault();     // no fake mouse click: a drag to look must not fire the tool
+      this.lookId = e.pointerId; this.lookAt = { x: e.clientX, y: e.clientY };
+    });
+    addEventListener('pointermove', e => {
+      if (e.pointerId !== this.lookId || menuOpen) return;
+      const dx = e.clientX - this.lookAt.x, dy = e.clientY - this.lookAt.y;
+      this.lookAt = { x: e.clientX, y: e.clientY };
+      if (tools.rotating && tools.grab) { tools.rotate(dx * 2, dy * 2); return; }
+      player.yaw -= dx * 0.006;
+      player.pitch = THREE.MathUtils.clamp(player.pitch - dy * 0.006, -1.45, 1.45);
+    });
+    const lookUp = e => { if (e.pointerId === this.lookId) this.lookId = null; };
+    addEventListener('pointerup', lookUp); addEventListener('pointercancel', lookUp);
+    // buttons: held ones press while the finger is down
+    const hold = (id, down, up) => {
+      const b = $(id);
+      b.addEventListener('pointerdown', e => { e.preventDefault(); b.classList.add('on'); footsteps.unlock(); audio(); down(); });
+      const off = () => { b.classList.remove('on'); up && up(); };
+      b.addEventListener('pointerup', off); b.addEventListener('pointercancel', off); b.addEventListener('pointerleave', off);
+    };
+    hold('tUse', () => { if (!player.dead && !menuOpen) tools.mouseDown(0); }, () => tools.mouseUp(0));
+    hold('tFreeze', () => { if (!player.dead && !menuOpen) tools.mouseDown(2); });
+    hold('tJump', () => pad.key('Space', true), () => pad.key('Space', false));
+    hold('tRun', () => { this.run = !this.run; $('tRun').classList.toggle('lit', this.run); });
+    hold('tTool', () => tools.select((tools.current + 1) % tools.list.length));
+    hold('tTalk', () => pad.key('KeyE', true), () => pad.key('KeyE', false));
+    hold('tMenu', () => { if (pad.menuButtons().length && !menuOpen) pad.closeMenu(); else if (ready) openMenu(!menuOpen); });
+    hold('tView', () => pad.key('KeyV', true), () => pad.key('KeyV', false));
+  },
+  stickMove(e, knob) {
+    let dx = e.clientX - this.stickC.x, dy = e.clientY - this.stickC.y;
+    const R = 55, L = Math.hypot(dx, dy);
+    if (L > R) { dx *= R / L; dy *= R / L; }
+    knob.style.transform = `translate(${dx}px, ${dy}px)`;
+    this.move.set(dx / R, -dy / R);
+  },
+};
+touch.build();
+
+// ---------------------------------------------------------------- VR (WebXR headsets: Quest, PC VR)
+// Your head is the ape's head. Left stick walks (left trigger runs), right stick turns in steps, right trigger uses
+// the tool you hold, right grip freezes / grabs, A jumps, B changes tool, X spawns a prop, Y spawns the next kind.
+const vr = {
+  on: false, yaw: 0, move: new THREE.Vector2(), head: new V3(0, 1.6, 0), turnReady: true, prev: {}, spawnI: 0,
+  init() {
+    if (!navigator.xr) return;
+    navigator.xr.isSessionSupported('immersive-vr').then(ok => {
+      if (!ok) return;
+      const b = VRButton.createButton(renderer);
+      b.id = 'vrButton';
+      document.body.appendChild(b);
+    }).catch(() => {});
+    renderer.xr.addEventListener('sessionstart', () => {
+      this.on = true; this.yaw = player.yaw; player.thirdPerson = false;
+      footsteps.unlock(); audio();
+      if (!locked) startUnlocked();
+      toast('VR: left stick walk, right stick turn, right trigger use, A jump');
+    });
+    renderer.xr.addEventListener('sessionend', () => {
+      this.on = false; this.move.set(0, 0); keys.ShiftLeft = false;
+      xrRig.position.set(0, 0, 0); xrRig.rotation.set(0, 0, 0); xrRig.updateMatrixWorld(true);
+    });
+  },
+  // controller buttons and sticks
+  input(dt) {
+    this.move.set(0, 0);
+    const session = this.on && renderer.xr.getSession();
+    if (!session) return;
+    const dz = v => Math.abs(v) < 0.15 ? 0 : (v - Math.sign(v) * 0.15) / 0.85;
+    for (const src of session.inputSources) {
+      const gp = src.gamepad; if (!gp) continue;
+      const h = src.handedness, prev = this.prev[h] || [];
+      const btn = i => !!gp.buttons[i] && gp.buttons[i].pressed;
+      const pressed = i => btn(i) && !prev[i], released = i => !btn(i) && prev[i];
+      const ax = dz(gp.axes[2] || 0), ay = dz(gp.axes[3] || 0);
+      if (h === 'left') {
+        this.move.set(ax, -ay);
+        keys.ShiftLeft = btn(0);                                                // trigger: run
+        if (pressed(4)) spawnProp(SPAWNABLES[this.spawnI]);                     // X: spawn
+        if (pressed(5)) { this.spawnI = (this.spawnI + 1) % SPAWNABLES.length; toast('Spawn: ' + SPAWNABLES[this.spawnI]); }   // Y: next kind
+      } else if (h === 'right') {
+        if (Math.abs(ax) > 0.7 && this.turnReady) { this.yaw -= Math.sign(ax) * Math.PI / 6; this.turnReady = false; }
+        if (Math.abs(ax) < 0.3) this.turnReady = true;
+        if (pressed(0) && !player.dead) tools.mouseDown(0);                     // trigger: use the tool
+        if (released(0)) tools.mouseUp(0);
+        if (pressed(1) && !player.dead) tools.mouseDown(2);                     // grip: freeze / grab
+        if (pressed(4)) pad.key('Space', true); if (released(4)) pad.key('Space', false);   // A: jump
+        if (pressed(5)) tools.select((tools.current + 1) % tools.list.length); // B: next tool
+      }
+      this.prev[h] = gp.buttons.map(b => b.pressed);
+    }
+  },
+  // put the rig where the game wants your eyes (or where a kill camera is), turned by the right stick
+  preRender() {
+    if (!this.on) return;
+    let yaw = this.yaw;
+    if (killers.some(kl => kl.state === 'killing')) {
+      const f = _v1.set(0, 0, -1).applyQuaternion(camera.quaternion);
+      yaw = Math.atan2(-f.x, -f.z);
+    }
+    xrRig.rotation.set(0, yaw, 0);
+    xrRig.position.copy(camera.position).sub(_v2.copy(this.head).applyAxisAngle(_v3.set(0, 1, 0), yaw));
+    xrRig.updateMatrixWorld(true);
+  },
+  // after drawing, the camera holds the headset's pose inside the rig: turn it back into a world pose for the game
+  postRender() {
+    if (!this.on) return;
+    this.head.copy(camera.position);
+    camera.position.applyMatrix4(xrRig.matrixWorld);
+    camera.quaternion.premultiply(xrRig.quaternion);
+    xrRig.position.set(0, 0, 0); xrRig.rotation.set(0, 0, 0); xrRig.updateMatrixWorld(true);
+    if (!killers.some(kl => kl.state === 'killing')) {
+      // you look (and aim, and walk) where your head points
+      const f = _v1.set(0, 0, -1).applyQuaternion(camera.quaternion);
+      player.yaw = Math.atan2(-f.x, -f.z);
+      player.pitch = Math.asin(THREE.MathUtils.clamp(f.y, -1, 1));
+    }
+  },
+};
+vr.init();
 
 // ---------------------------------------------------------------- killers (NPCs that hunt the player)
 const KILL_SCALE = 1.35;            // saw runner kill scene: its victim ape ~= our ape's size at this scale
@@ -2931,10 +3089,10 @@ const clock = new THREE.Clock();
 let time = 0;
 const perf = { physics: 0, logic: 0, frame: 0 };   // last frame's cost in ms
 function frame() {
-  requestAnimationFrame(frame);
   const dt = Math.min(clock.getDelta(), 0.05); time += dt;
   const t0 = performance.now();
   pad.update(dt);
+  vr.input(dt);
   updatePlayer(dt);
   tools.preStep();
   world.step(1 / 60, dt, 4);
@@ -2959,7 +3117,9 @@ function frame() {
   sun.position.set(bp.x + 30, bp.y + 60, bp.z + 20); sun.target.position.set(bp.x, bp.y, bp.z);
   $('health').textContent = player.health;
   perf.logic = performance.now() - t0 - perf.physics;
+  vr.preRender();
   renderer.render(scene, camera);
+  vr.postRender();
   perf.frame = performance.now() - t0;
 }
 
@@ -3013,11 +3173,11 @@ Promise.all([loadApe(), loadMap(), loadPropModels()]).then(() => computer.load()
   coinPickups.spawnAll(30);
   updateCoins();
   if (save.owned.includes('stick')) giveStickTool();
-  window.__ape = { rig, player, props, apeRoot, camera, tools, killers, shop, save, stick, nav, perf, computer, footsteps, dread, pad, ragdolls, bloodMoon };
+  window.__ape = { rig, player, props, apeRoot, camera, tools, killers, shop, save, stick, nav, perf, computer, footsteps, dread, pad, ragdolls, bloodMoon, touch, vr, xrRig };
   const extras = stick.load().then(() => shop.attachStick()).catch(err => { console.error(err); toast('Stick failed to load: ' + err.message); });
   return Promise.all([extras, ...killers.map(kl => kl.load().catch(err => { console.error(err); toast(kl.name + ' failed to load: ' + err.message); }))]);
 }).catch(err => {
   console.error(err);
   $('loading').textContent = 'Could not load the game: ' + err.message;
 });
-frame();
+renderer.setAnimationLoop(frame);     // runs on the headset's clock in VR, like requestAnimationFrame otherwise
