@@ -10,4 +10,4 @@ Phone / tablet: on-screen stick to walk, drag to look, buttons for use, jump, fr
 
 VR (Quest browser or PC VR): press ENTER VR. Left stick walk, left trigger run, right stick turn, right trigger use tool, grip freeze, A jump, B next tool, X spawn, Y next prop.
 
-Model credits: Saw Runner "Lar_saw_runner (2)" by Goofyahhdad16, Blood Moon Gus "Bloodmoon Gus (Halloween LAR Revamp)" by Zman (sketchfab.com), CC-BY-4.0. Other models and sounds belong to their creators.
+Model credits: plush hats by @maaahhh9 (YouTube). Saw Runner "Lar_saw_runner (2)" by Goofyahhdad16, Blood Moon Gus "Bloodmoon Gus (Halloween LAR Revamp)" by Zman (sketchfab.com), CC-BY-4.0. Other models and sounds belong to their creators.

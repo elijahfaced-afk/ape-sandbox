@@ -397,6 +397,7 @@ async function loadApe() {
   apeRoot.updateMatrixWorld(true);
   apeSource = fbx;
   Object.assign(rig, buildRig(fbx, apeRoot));
+  hats.player = hats.register(bone('Bone_002'), new V3(0, 0, -1));      // the ape faces -Z here
   console.log('[ape] arm length', rig.reach.toFixed(2), 'shoulder height', rig.shoulderY.toFixed(2));
 }
 
@@ -1825,6 +1826,7 @@ const ragdolls = {
     src.forEach((o, i) => { dst[i].position.copy(o.position); dst[i].quaternion.copy(o.quaternion); dst[i].scale.copy(o.scale); });
     const bone = {};
     c.traverse(o => { if (o.isMesh) { o.frustumCulled = false; o.castShadow = true; } if (o.isBone && !bone[o.name]) bone[o.name] = o; });
+    c.traverse(o => { if (o.name === 'hatHolder') o.visible = true; });   // your hat comes along (it's hidden on you in first person)
     apeRoot.updateMatrixWorld(true);
     const g = new THREE.Group(); g.matrixAutoUpdate = false;
     g.matrix.copy(apeSource.parent.matrixWorld); g.add(c); scene.add(g); g.updateMatrixWorld(true);
@@ -2001,7 +2003,7 @@ const gus = makeKiller({
     const victim0 = head.getWorldPosition(new V3()), killer0 = gusHead.getWorldPosition(new V3());
     const killH = skinnedBounds(gusMesh).getSize(new V3()).y;
     actions.forEach(a => a.stop());
-    this.kill = { root, mixer, actions, cam, victim: jump.scene.getObjectByName('Object_88'), victim0, dir0: victim0.clone().sub(killer0), scale: GUS_HEIGHT / killH,
+    this.kill = { root, mixer, actions, cam, victim: jump.scene.getObjectByName('Object_88'), hatHead: head, victim0, dir0: victim0.clone().sub(killer0), scale: GUS_HEIGHT / killH,
       duration: Math.max(...jump.animations.map(c => c.duration)),
       // the camera node looks down its +X with its +Z up, not the -Z and +Y a three.js camera uses
       camFix: new Q().setFromAxisAngle(new V3(0, 1, 0), -Math.PI / 2).multiply(new Q().setFromAxisAngle(new V3(0, 0, 1), -Math.PI / 2)) };
@@ -2509,7 +2511,7 @@ const killers = [sawRunner, lethalApe, bladeApe, gus, mimic, craw, bloodGus];
 // ---------------------------------------------------------------- save data, coins, faces
 const SAVE_KEY = 'apeSandbox.save';
 const save = (() => {
-  const def = { coins: 20, owned: ['face0'], face: 0 };
+  const def = { coins: 20, owned: ['face0'], face: 0, hat: -1 };
   try { return Object.assign(def, JSON.parse(localStorage.getItem(SAVE_KEY) || '{}')); } catch { return def; }
 })();
 function persist() { try { localStorage.setItem(SAVE_KEY, JSON.stringify(save)); } catch {} }
@@ -2526,6 +2528,71 @@ const faceTex = FACES.map((_, i) => {
   t.colorSpace = THREE.SRGBColorSpace; t.wrapS = t.wrapT = THREE.RepeatWrapping;
   return t;
 });
+// ---------------------------------------------------------------- plush hats (the Big Scary Plush hats by @maaahhh9)
+// Bought and worn at the Ape Shop. The hat sits on your ape's head, stays on your ragdoll, and every kill with a
+// victim of its own puts it on that victim too, so you keep your hat when a killer gets you.
+const HATS = [['Default_Hat', 'Plush Hat', 40], ['Frog_Hat', 'Frog Hat', 60], ['Cat_Ears_Hat', 'Cat Ears Hat', 60]];
+const hats = {
+  templates: [], wearers: [], loaded: false, player: null,
+  async load() {
+    const mgr = new THREE.LoadingManager();
+    mgr.setURLModifier(u => (u.startsWith('blob:') || u.startsWith('data:') || u.endsWith('.fbx')) ? u : 'assets/hats/fur.png');
+    const f = await new FBXLoader(mgr).loadAsync('assets/hats/hats.fbx');
+    f.updateMatrixWorld(true);
+    for (const [name] of HATS) {
+      const m = f.getObjectByName(name).clone();
+      const mats = [].concat(m.material).map(x => {
+        if (x.map) x.map.colorSpace = THREE.SRGBColorSpace;
+        return new THREE.MeshStandardMaterial({ color: x.color, map: x.map || null, roughness: 0.95 });
+      });
+      m.material = mats.length === 1 ? mats[0] : mats;
+      m.castShadow = true;
+      // 1 wide, bottom in the middle at the origin, front along +Z
+      const fit = new THREE.Group(); fit.add(m);
+      m.position.set(0, 0, 0); fit.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(fit), size = box.getSize(new V3()), c = box.getCenter(new V3());
+      const s = 1 / Math.max(size.x, size.z);
+      fit.scale.setScalar(s); fit.position.set(-c.x * s, -box.min.y * s, -c.z * s);
+      this.templates.push(new THREE.Group().add(fit));
+    }
+    this.loaded = true;
+  },
+  // fit a hat holder onto a head bone from the pose it is in now: on top of the head's vertices, as wide as the
+  // head, facing `front` (world). It rides the bone from then on. Returns the wearer, or null if there's no head.
+  register(headBone, front) {
+    const heads = new Set(); headBone.traverse(o => heads.add(o));
+    let root = headBone; while (root.parent) root = root.parent;
+    root.updateMatrixWorld(true);
+    const box = new THREE.Box3(), v = new V3();
+    root.traverse(o => {
+      if (!o.isSkinnedMesh) return;
+      o.skeleton.update();
+      const si = o.geometry.attributes.skinIndex, sw = o.geometry.attributes.skinWeight;
+      for (let i = 0; i < si.count; i += 2) {
+        let w = 0;
+        for (let k = 0; k < 4; k++) if (heads.has(o.skeleton.bones[si.getComponent(i, k)])) w += sw.getComponent(i, k);
+        if (w > 0.5) { o.getVertexPosition(i, v); box.expandByPoint(o.localToWorld(v)); }
+      }
+    });
+    if (box.isEmpty()) return null;
+    const size = box.getSize(new V3()), c = box.getCenter(new V3());
+    const holder = new THREE.Group(); holder.name = 'hatHolder';
+    holder.position.set(c.x, box.max.y - size.y * 0.3, c.z);          // sunk onto the head
+    holder.rotation.set(0, Math.atan2(front.x, front.z), 0);
+    holder.scale.setScalar(Math.max(size.x, size.z) * 1.25);
+    scene.add(holder); holder.updateMatrixWorld(true);
+    headBone.attach(holder);
+    const w = { holder };
+    this.wearers.push(w);
+    return w;
+  },
+  dress(w) {
+    w.holder.clear();
+    if (save.hat >= 0 && this.templates[save.hat]) w.holder.add(this.templates[save.hat].clone());
+  },
+  wearAll() { for (const w of this.wearers) this.dress(w); },
+};
+
 function setFace(obj, i) {
   obj.traverse(o => {
     if (!o.isMesh) return;
@@ -2637,6 +2704,7 @@ const SHOP_ITEMS = [
   { id: 'stick', name: 'Gorilla Tag Stick', price: 50, desc: 'Tool 4. Bonk the killers to stun them (+10 coins each bonk).' },
   { id: 'magnet', name: 'Coin Magnet', price: 120, desc: 'Pick up coins from much farther away.' },
   ...FACES.map(([n, price], i) => ({ id: 'face' + i, face: i, name: n + ' face', price, desc: 'Wear it on your ape.' })),
+  ...HATS.map(([, n, price], i) => ({ id: 'hat' + i, hat: i, name: n, price, desc: 'You want to look cool? It stays on, even when a killer gets you.' })),
 ];
 const shop = {
   C: new V3(14, 0, 6), open: false, npcRoot: new THREE.Group(), npcRig: null, npcStick: null, waveT: 0, typeTimer: 0,
@@ -2749,12 +2817,14 @@ const shop = {
     const box = $('items'); box.innerHTML = '';
     for (const it of SHOP_ITEMS) {
       const owned = save.owned.includes(it.id), worn = it.face !== undefined && save.face === it.face;
+      const wornHat = it.hat !== undefined && save.hat === it.hat, wearable = it.face !== undefined || it.hat !== undefined;
       const row = document.createElement('div'); row.className = 'item';
-      row.innerHTML = (it.face !== undefined ? `<img src="assets/faces/face${it.face}.png" alt="">` : `<div class="ico">${it.id === 'stick' ? '🪵' : '🧲'}</div>`) +
+      row.innerHTML = (it.face !== undefined ? `<img src="assets/faces/face${it.face}.png" alt="">` : `<div class="ico">${it.hat !== undefined ? ['🧢', '🐸', '🐱'][it.hat] : it.id === 'stick' ? '🪵' : '🧲'}</div>`) +
         `<div class="txt"><b>${it.name}</b><span>${it.desc}</span></div>`;
       const btn = document.createElement('button');
       if (worn) { btn.textContent = 'Wearing'; btn.disabled = true; }
-      else if (owned && it.face !== undefined) { btn.textContent = 'Wear'; btn.onclick = () => this.wear(it); }
+      else if (wornHat) { btn.textContent = 'Take off'; btn.onclick = () => this.wear({ hat: -1, name: 'hat' }, 'Back to the natural look. Hoo!'); }
+      else if (owned && wearable) { btn.textContent = 'Wear'; btn.onclick = () => this.wear(it); }
       else if (owned) { btn.textContent = 'Owned'; btn.disabled = true; }
       else { btn.textContent = it.price + ' coins'; btn.onclick = () => this.buy(it); }
       row.append(btn); box.append(row);
@@ -2765,13 +2835,13 @@ const shop = {
     save.coins -= it.price; save.owned.push(it.id); persist(); updateCoins();
     beep(900, 0.07, 'square', 0.05); setTimeout(() => beep(1200, 0.1, 'square', 0.05), 90);
     this.waveT = 1.2;
-    if (it.face !== undefined) return this.wear(it, `Pleasure doing business! The ${it.name} looks great on you.`);
+    if (it.face !== undefined || it.hat !== undefined) return this.wear(it, `Pleasure doing business! The ${it.name} looks great on you.`);
     if (it.id === 'stick') { giveStickTool(); tools.select(tools.list.indexOf('Stick')); }
     this.showShop(it.id === 'stick' ? "A fine stick! It's tool 4. Click to bonk anything that chases you." : 'Coins will practically fly to you now. Hoo hoo!');
   },
   wear(it, line) {
-    save.face = it.face; persist();
-    setFace(apeSource, it.face);
+    if (it.hat !== undefined) { save.hat = it.hat; persist(); hats.wearAll(); }
+    else { save.face = it.face; persist(); setFace(apeSource, it.face); }
     this.showShop(line || `Looking sharp in the ${it.name}!`);
   },
 };
@@ -3220,6 +3290,7 @@ function frame() {
   stick.update(dt);
   shop.update(dt, time);
   if (computer.tag) computer.tag.visible = player.thirdPerson && apeRoot.visible;   // your own name: third person only
+  if (hats.player) hats.player.holder.visible = player.thirdPerson && !vr.on;     // your own hat too: it would hang over your eyes
   coinPickups.update(dt, time);
   blood.update(dt);
   tools.updateBeam(time);
@@ -3282,10 +3353,18 @@ Promise.all([loadApe(), loadMap(), loadPropModels()]).then(() => computer.load()
   coinPickups.spawnAll(30);
   updateCoins();
   if (save.owned.includes('stick')) giveStickTool();
-  window.__ape = { rig, player, props, apeRoot, camera, tools, killers, shop, save, stick, nav, perf, computer, footsteps, dread, pad, ragdolls, bloodMoon, touch, vr, xrRig, secCams };
+  window.__ape = { rig, player, props, apeRoot, camera, tools, killers, shop, save, stick, nav, perf, computer, footsteps, dread, pad, ragdolls, bloodMoon, touch, vr, xrRig, secCams, hats };
   const extras = stick.load().then(() => shop.attachStick()).catch(err => { console.error(err); toast('Stick failed to load: ' + err.message); });
   const cams = secCams.load().then(() => secCams.placeAll()).catch(err => { console.error(err); toast('Cameras failed to load: ' + err.message); });
-  return Promise.all([extras, cams, ...killers.map(kl => kl.load().catch(err => { console.error(err); toast(kl.name + ' failed to load: ' + err.message); }))]);
+  const hatsReady = hats.load().then(() => hats.wearAll()).catch(err => { console.error(err); toast('Hats failed to load: ' + err.message); });
+  // the kills with a victim of their own put your hat on it (the kills that use your ragdoll already carry it)
+  const dressVictim = kl => {
+    const k = kl.kill, head = k && (k.hatHead || k.head);
+    if (!head || !k.dir0) return;
+    const w = hats.register(head, new V3(-k.dir0.x, 0, -k.dir0.z).normalize());
+    if (w && hats.loaded) hats.dress(w);
+  };
+  return Promise.all([extras, cams, hatsReady, ...killers.map(kl => kl.load().then(() => dressVictim(kl)).catch(err => { console.error(err); toast(kl.name + ' failed to load: ' + err.message); }))]);
 }).catch(err => {
   console.error(err);
   $('loading').textContent = 'Could not load the game: ' + err.message;
