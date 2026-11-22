@@ -3086,6 +3086,111 @@ const bloodMoon = {
   },
 };
 
+// ---------------------------------------------------------------- security cameras (the Lethal Ape camera model)
+// Up on the walls around the building. Each one sweeps left and right; when it sees you it stops, turns to follow
+// you (left / right and up / down) and its light goes red. Lose it for 2 s and it goes back to sweeping.
+const SECCAM_SCALE = 0.02;                              // the file is in centimetres x2: about 1 m long like this
+const SECCAM_LENS = new V3(-0.04, -0.09, 0.86);         // the lens, in the pan pivot's space
+const SECCAM_TILT = 0.43;                               // the lens already looks this far down
+const secCams = {
+  list: [], src: null, beepT: 0,
+  async load() {
+    const f = await new FBXLoader().loadAsync('assets/seccam/Camera.fbx');
+    f.traverse(o => {
+      if (!o.isMesh) return;
+      o.castShadow = true;
+      o.material = [].concat(o.material).map(m => new THREE.MeshStandardMaterial({ color: m.color, roughness: 0.55, metalness: 0.2 }));
+    });
+    // looks down its +Z; put its back (where the bracket meets the wall) on the pivot
+    f.scale.setScalar(SECCAM_SCALE);
+    f.position.z = 26 * SECCAM_SCALE;
+    this.src = f;
+  },
+  // a wall about 3 m up, near a walkable spot: returns where to bolt the camera and which way it faces
+  wallSpot(nd) {
+    const up = _v1.set(nd.x, nd.y + 1.5, nd.z);
+    camRay.set(up, _v2.set(0, 1, 0)); camRay.far = 8;
+    const ceil = camRay.intersectObjects(staticMeshes, false)[0];
+    const y = nd.y + Math.min(ceil ? ceil.distance + 1.5 - 0.6 : 3.2, 3.2);
+    let best = null;
+    for (let i = 0; i < 8; i++) {
+      const a = i / 8 * Math.PI * 2, dir = new V3(Math.sin(a), 0, Math.cos(a));
+      camRay.set(new V3(nd.x, y, nd.z), dir); camRay.far = 5;
+      const hit = camRay.intersectObjects(staticMeshes, false)[0];
+      if (!hit || !hit.face || (best && hit.distance > best.hit.distance)) continue;
+      const n = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
+      if (Math.abs(n.y) > 0.3) continue;                   // a wall, not a slope
+      best = { hit, n };
+    }
+    if (!best) return null;
+    const n = best.n.setY(0).normalize();
+    return { pos: best.hit.point.clone().addScaledVector(n, 0.04), yaw: Math.atan2(n.x, n.z) };
+  },
+  make(spot) {
+    const base = new THREE.Group(); base.position.copy(spot.pos); base.rotation.y = spot.yaw;
+    const pan = new THREE.Group(), tilt = new THREE.Group();
+    base.add(pan); pan.add(tilt); tilt.add(this.src.clone());
+    const led = new THREE.Mesh(new THREE.SphereGeometry(0.035, 10, 8), new THREE.MeshBasicMaterial({ color: '#3f6' }));
+    led.position.set(0.12, 0.3, 0.72); tilt.add(led);
+    scene.add(base);
+    const c = { base, pan, tilt, led, phase: Math.random() * Math.PI * 2, speed: 0.6 + Math.random() * 0.3, yaw: 0, pitch: 0, seeT: 0, lookT: 0, sees: false };
+    this.list.push(c);
+    return c;
+  },
+  // one right by the spawn (so you meet one straight away), the rest spread over the building
+  placeAll(count = 16) {
+    const spawn = player.body.position, spots = [];
+    const tryNode = nd => {
+      if (!nd || spots.some(s => s.pos.distanceTo(_v3.set(nd.x, nd.y, nd.z)) < 18)) return false;
+      const s = this.wallSpot(nd); if (!s) return false;
+      spots.push(s); return true;
+    };
+    const near = nav.nodes.filter(n => Math.hypot(n.x - spawn.x, n.z - spawn.z) < 9 && Math.abs(n.y - spawn.y) < 1).sort(() => Math.random() - 0.5);
+    for (const nd of near) if (tryNode(nd)) break;
+    for (let i = 0; i < 400 && spots.length < count; i++) tryNode(nav.random(n => n.open > 15));
+    for (const s of spots) this.make(s);
+  },
+  update(dt) {
+    if (!this.list.length) return;
+    const eye = _v1.set(apeRoot.position.x, apeRoot.position.y + 1.3, apeRoot.position.z);
+    this.beepT -= dt;
+    for (const c of this.list) {
+      // where are you, seen from this camera's mount?
+      const local = c.base.worldToLocal(_v2.copy(eye));
+      const aYaw = Math.atan2(local.x, local.z), flat = Math.hypot(local.x, local.z), dist = local.length();
+      if ((c.lookT -= dt) <= 0) {
+        c.lookT = 0.12;
+        c.sees = false;
+        if (!player.dead && apeRoot.visible && dist < 28 && Math.abs(aYaw) < 1.35 && Math.abs(aYaw - c.yaw) < 0.75) {
+          const lens = c.tilt.localToWorld(_v3.copy(SECCAM_LENS));
+          const to = eye.clone().sub(lens), L = to.length();
+          camRay.set(lens, to.normalize()); camRay.far = L;
+          c.sees = camRay.intersectObjects(staticMeshes, false).length === 0;
+        }
+        if (c.sees) {
+          if (c.seeT <= 0 && this.beepT <= 0) { beep(1400, 0.08, 'square', 0.04); setTimeout(() => beep(1000, 0.1, 'square', 0.04), 110); this.beepT = 1.5; }
+          c.seeT = 2;
+        }
+      }
+      c.seeT -= dt;
+      let wantYaw, wantPitch;
+      if (c.seeT > 0) {
+        // watching you: turn and tilt to keep you in the middle
+        wantYaw = THREE.MathUtils.clamp(aYaw, -1.3, 1.3);
+        wantPitch = THREE.MathUtils.clamp(Math.atan2(-local.y, flat) - SECCAM_TILT, -0.6, 0.9);
+      } else {
+        // sweeping the room
+        c.phase += dt * c.speed;
+        wantYaw = Math.sin(c.phase) * 0.95; wantPitch = 0;
+      }
+      const k = 1 - Math.exp(-(c.seeT > 0 ? 7 : 2.5) * dt);
+      c.yaw += (wantYaw - c.yaw) * k; c.pitch += (wantPitch - c.pitch) * k;
+      c.pan.rotation.y = c.yaw; c.tilt.rotation.x = c.pitch;
+      c.led.material.color.set(c.seeT > 0 ? '#ff2a1a' : '#3f6');
+    }
+  },
+};
+
 // ---------------------------------------------------------------- main loop
 let ready = false;
 const clock = new THREE.Clock();
@@ -3111,6 +3216,7 @@ function frame() {
   footsteps.update(dt);
   dread.update(dt);
   bloodMoon.update(dt);
+  secCams.update(dt);
   stick.update(dt);
   shop.update(dt, time);
   if (computer.tag) computer.tag.visible = player.thirdPerson && apeRoot.visible;   // your own name: third person only
@@ -3176,9 +3282,10 @@ Promise.all([loadApe(), loadMap(), loadPropModels()]).then(() => computer.load()
   coinPickups.spawnAll(30);
   updateCoins();
   if (save.owned.includes('stick')) giveStickTool();
-  window.__ape = { rig, player, props, apeRoot, camera, tools, killers, shop, save, stick, nav, perf, computer, footsteps, dread, pad, ragdolls, bloodMoon, touch, vr, xrRig };
+  window.__ape = { rig, player, props, apeRoot, camera, tools, killers, shop, save, stick, nav, perf, computer, footsteps, dread, pad, ragdolls, bloodMoon, touch, vr, xrRig, secCams };
   const extras = stick.load().then(() => shop.attachStick()).catch(err => { console.error(err); toast('Stick failed to load: ' + err.message); });
-  return Promise.all([extras, ...killers.map(kl => kl.load().catch(err => { console.error(err); toast(kl.name + ' failed to load: ' + err.message); }))]);
+  const cams = secCams.load().then(() => secCams.placeAll()).catch(err => { console.error(err); toast('Cameras failed to load: ' + err.message); });
+  return Promise.all([extras, cams, ...killers.map(kl => kl.load().catch(err => { console.error(err); toast(kl.name + ' failed to load: ' + err.message); }))]);
 }).catch(err => {
   console.error(err);
   $('loading').textContent = 'Could not load the game: ' + err.message;
