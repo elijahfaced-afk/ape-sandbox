@@ -126,7 +126,59 @@ function addStatic(size, pos, material, rot = [0, 0, 0]) {
 // The world is the Lethal Ape Redux map (an indoor facility), loaded from assets/map.
 // Its mesh doubles as the physics floor/walls (a trimesh: spheres collide with it) and as the source of
 // a walk graph the killers use to find their way through the corridors.
-let mapReady = false, FALL_Y = -30;
+let mapReady = false, FALL_Y = -30, mapMesh = null;
+// The map is a thin trimesh: a small, fast ball (prop edges, ragdoll limbs) can step right through it in one physics
+// step and drop under the floor. After each step, anything that moved through the map surface is put back on it.
+const antiTunnel = {
+  prev: new Map(), ray: new THREE.Raycaster(), d: new V3(), a: new V3(), b: new V3(), off: new CANNON.Vec3(), w: new CANNON.Vec3(),
+  bodies() {
+    const out = [];
+    for (const p of props) if (!p.frozen && p.body.type === CANNON.Body.DYNAMIC) out.push(p.body);
+    for (const rd of ragdolls.list) for (const b of rd.bodies) if (b.type === CANNON.Body.DYNAMIC) out.push(b);
+    return out;
+  },
+  // where each ball of the body is now
+  spheres(b, out) {
+    for (let i = 0; i < b.shapes.length; i++) {
+      const sh = b.shapes[i]; if (!(sh instanceof CANNON.Sphere)) continue;
+      b.quaternion.vmult(b.shapeOffsets[i], this.w);
+      out.push(b.position.x + this.w.x, b.position.y + this.w.y, b.position.z + this.w.z, sh.radius);
+    }
+    return out;
+  },
+  before() {
+    if (!mapMesh) return;
+    for (const b of this.bodies()) {
+      if (b.velocity.lengthSquared() < 9) { this.prev.delete(b); continue; }   // slow things can't tunnel
+      this.prev.set(b, this.spheres(b, []));
+    }
+  },
+  after() {
+    if (!mapMesh) return;
+    for (const [b, was] of this.prev) {
+      const now = this.spheres(b, []);
+      if (now.length !== was.length) continue;
+      let fix = null, best = Infinity;
+      for (let i = 0; i < now.length; i += 4) {
+        this.a.set(was[i], was[i + 1], was[i + 2]); this.b.set(now[i], now[i + 1], now[i + 2]);
+        const L = this.a.distanceTo(this.b); if (L < 1e-4) continue;
+        this.d.subVectors(this.b, this.a).divideScalar(L);
+        this.ray.set(this.a, this.d); this.ray.far = L + now[i + 3];
+        const hit = this.ray.intersectObject(mapMesh, false)[0];
+        if (!hit || hit.distance >= best) continue;
+        // the surface normal, facing back where the ball came from
+        const n = hit.face.normal.clone(); if (n.dot(this.d) > 0) n.negate();
+        best = hit.distance;
+        fix = { n, push: this.b.clone().sub(hit.point).dot(n) * -1 + now[i + 3] + 0.01 };
+      }
+      if (!fix || fix.push <= 0) continue;
+      b.position.x += fix.n.x * fix.push; b.position.y += fix.n.y * fix.push; b.position.z += fix.n.z * fix.push;
+      const vn = b.velocity.x * fix.n.x + b.velocity.y * fix.n.y + b.velocity.z * fix.n.z;
+      if (vn < 0) { b.velocity.x -= vn * fix.n.x; b.velocity.y -= vn * fix.n.y; b.velocity.z -= vn * fix.n.z; }   // stop going into it (no bounce)
+    }
+    this.prev.clear();
+  },
+};
 async function loadMap() {
   const mgr = new THREE.LoadingManager();
   mgr.setURLModifier(u => (u.startsWith('blob:') || u.startsWith('data:')) ? u : 'assets/map/' + u.split(/[\\/]/).pop());
@@ -151,7 +203,7 @@ async function loadMap() {
   });
   const mesh = new THREE.Mesh(geo, mats.length > 1 ? mats : mats[0]);
   mesh.receiveShadow = true;                       // no castShadow: the roof would shade every room
-  scene.add(mesh); staticMeshes.push(mesh);
+  scene.add(mesh); staticMeshes.push(mesh); mapMesh = mesh;
 
   // physics: one trimesh per 12 m block (a triangle goes in every block it touches). A single trimesh
   // of the whole map makes every collision test walk thousands of big triangles.
@@ -312,18 +364,42 @@ const nav = {
 // ---------------------------------------------------------------- sound
 let actx = null;
 function audio() { if (!actx) actx = new AudioContext(); return actx; }
+// volume: a master level and three groups, saved in the browser. Every synth sound goes through bus(group);
+// the killers' sound files (HTML audio) are scaled by htmlVol().
+const VOL_KEY = 'apeSandbox.volume', VOL_CATS = ['master', 'monsters', 'effects', 'ambience'];
+const volume = Object.assign({ master: 0.5, monsters: 0.7, effects: 0.7, ambience: 0.6, muted: false },
+  (() => { try { return JSON.parse(localStorage.getItem(VOL_KEY)) || {}; } catch { return {}; } })());
+let buses = null;
+function bus(cat) {
+  const a = audio();
+  if (!buses) {
+    const m = a.createGain(); m.connect(a.destination); buses = { master: m };
+    for (const c of VOL_CATS.slice(1)) { const g = a.createGain(); g.connect(m); buses[c] = g; }
+    applyVolume();
+  }
+  return buses[cat] || buses.effects;
+}
+const htmlVol = () => volume.muted ? 0 : volume.master * volume.monsters;
+function applyVolume() {
+  try { localStorage.setItem(VOL_KEY, JSON.stringify(volume)); } catch {}
+  if (buses) {
+    buses.master.gain.value = volume.muted ? 0 : volume.master;
+    for (const c of VOL_CATS.slice(1)) buses[c].gain.value = volume[c];
+  }
+  try { for (const kl of killers) for (const a of Object.values(kl.sounds)) if (a.baseVol != null) a.volume = Math.min(1, a.baseVol * htmlVol()); } catch {}
+}
 function beep(freq = 440, dur = 0.08, type = 'sine', vol = 0.08) {
   const a = audio(), o = a.createOscillator(), g = a.createGain();
   o.type = type; o.frequency.value = freq; g.gain.value = vol;
   g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + dur);
-  o.connect(g).connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  o.connect(g).connect(bus('effects')); o.start(); o.stop(a.currentTime + dur);
 }
 function boomSound(vol = 0.5) {
   const a = audio(), len = a.sampleRate * 0.8, buf = a.createBuffer(1, len, a.sampleRate), d = buf.getChannelData(0);
   for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3);
   const s = a.createBufferSource(), f = a.createBiquadFilter(), g = a.createGain();
   f.type = 'lowpass'; f.frequency.value = 700; g.gain.value = vol;
-  s.buffer = buf; s.connect(f).connect(g).connect(a.destination); s.start();
+  s.buffer = buf; s.connect(f).connect(g).connect(bus('effects')); s.start();
 }
 
 // ---------------------------------------------------------------- UI helpers
@@ -540,6 +616,7 @@ function updatePlayer(dt) {
 }
 function respawn() {
   player.body.position.copy(SPAWN); player.body.velocity.set(0, 0, 0);
+  director.reset();       // back at the start: the hunt starts over
   player.health = 100;
 }
 function hurt(n) {
@@ -763,14 +840,21 @@ function spawnProp(kind) {
   const f = camForward();
   const pos = hit ? hit.point.clone().addScaledVector(hit.face ? hit.face.normal.clone().transformDirection(hit.object.matrixWorld) : new V3(0, 1, 0), 0.1)
                   : camera.position.clone().addScaledVector(f, 6);
-  const bb = new THREE.Box3().setFromObject(p.mesh);
-  pos.y += (bb.max.y - bb.min.y) / 2 + 0.05;
-  p.body.position.set(pos.x, pos.y, pos.z);
   p.body.quaternion.mult(new CANNON.Quaternion().setFromEuler(0, player.yaw, 0), p.body.quaternion);
+  pos.y += propHalfHeight(p) + 0.05;
+  p.body.position.set(pos.x, pos.y, pos.z);
   syncProp(p);
   undoStack.push(p);
   beep(660, 0.06, 'square', 0.04);
   updateCount();
+}
+// how far the physics shape reaches below the body's centre (the mesh's box is wrong for skinned models like the statue)
+function propHalfHeight(p) {
+  const b = p.body, y = b.position.y;
+  b.position.y = 0; b.aabbNeedsUpdate = true; b.updateAABB();
+  const h = -b.aabb.lowerBound.y;
+  b.position.y = y; b.aabbNeedsUpdate = true;
+  return h;
 }
 function removeProp(p, puff = true) {
   if (p.dead) return;
@@ -1019,7 +1103,8 @@ addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT') {             // typing a name on the computer: no game keys
     if (e.code === 'Enter' && e.target.id === 'pcName') computer.setName();
     if (e.code === 'Enter' && e.target.id === 'netCode') net.joinFromPanel();
-    if (e.code === 'Escape') computer.close();
+    if (e.code === 'Escape') { computer.close(); if (soundPanel.open) soundPanel.show(false); if (net.panelOpen) net.openPanel(false); }
+    if (e.code === 'KeyP' && soundPanel.open) soundPanel.show(false);
     return;
   }
   if (e.repeat) { keys[e.code] = true; return; }
@@ -1030,15 +1115,17 @@ addEventListener('keydown', e => {
     else player.thirdPerson = !player.thirdPerson;
   }
   if ((e.code === 'KeyK' || e.code === 'KeyB') && net.client && ready) { net.send({ t: 'cmd', c: e.code }); toast('Asked the host'); }
-  else if (e.code === 'KeyK') { const on = !killers[0].enabled; killers.forEach(kl => { if (!kl.eventOnly) kl.setEnabled(on); }); toast(on ? 'The killers are hunting you' : 'Killers gone'); }
+  else if (e.code === 'KeyK') { const on = director.toggle(); toast(on ? 'The killers are coming back' : 'Killers gone'); }
   else if (e.code === 'KeyB' && ready) bloodMoon.toggle();
   if (e.code === 'KeyO' && ready && !shop.open && !computer.open) net.openPanel(true);
+  if (e.code === 'KeyP' && ready && !shop.open && !computer.open && !net.panelOpen) soundPanel.show(!soundPanel.open);
   if (e.code === 'KeyH') $('hint').style.display = $('hint').style.display === 'none' ? '' : 'none';
   if (e.code.startsWith('Digit')) { const i = +e.code.slice(5) - 1; if (i >= 0 && i < tools.list.length) tools.select(i); }
   if (e.code === 'KeyE' && tools.grab && tools.grab.mode === 'phys') tools.rotating = true;
   else if (e.code === 'KeyE' && !menuOpen && !player.dead) { if (computer.near()) computer.openPanel(); else shop.talk(); }
   if (e.code === 'Escape' && shop.open) shop.close();
   if (e.code === 'Escape' && net.panelOpen) net.openPanel(false);
+  if (e.code === 'Escape' && soundPanel.open) soundPanel.show(false);
   if (e.code === 'Escape' && computer.open) computer.close();
   if (e.code === 'KeyR') { const p = propOf(aimHit()); if (p && p.frozen) { setFrozen(p, false); toast('Unfrozen'); } }
   if (e.code === 'KeyZ') {
@@ -1314,7 +1401,8 @@ function makeKiller(def) {
     playSound(name, volume = 1) {
       const s = this.sounds[name];
       if (!s) return;
-      s.volume = THREE.MathUtils.clamp(volume, 0, 1);
+      s.baseVol = THREE.MathUtils.clamp(volume, 0, 1);
+      s.volume = Math.min(1, s.baseVol * htmlVol());
       s.currentTime = 0;
       s.play().catch(() => {});
     },
@@ -1368,7 +1456,7 @@ function makeKiller(def) {
       const p = player.body.position;
       let nd = null;
       for (let extra = 0; !nd && extra <= 30; extra += 6) {
-        const ring = nav.nodes.filter(n => { const d = Math.hypot(n.x - p.x, n.z - p.z); return d >= 53 && d <= 57 + extra; });
+        const ring = nav.nodes.filter(n => { const d = Math.hypot(n.x - p.x, n.z - p.z); return d >= 53 && d <= 57 + extra && Math.hypot(n.x - SPAWN.x, n.z - SPAWN.z) > 30; });
         if (ring.length) nd = ring[Math.floor(Math.random() * ring.length)];
       }
       nd = nd || (nav.nodes.length ? nav.random() : { x: 60, y: 1, z: 60 });
@@ -1461,7 +1549,7 @@ function makeKiller(def) {
             this.playSound('spotted', Math.max(0.2, 1 - dist / 40));   // still heard when it spots you from far off
             this.onSpot?.();
           } else if (this.alerted && dist > this.seeRange + 21 && !this.alwaysKnows) this.alerted = false;
-          speed = this.alerted ? this.chaseSpeed : this.walkSpeed;
+          speed = (this.alerted ? this.chaseSpeed : this.walkSpeed) * director.speedK;   // a bit faster deep in
           dir.copy(this.steer(p, dt, sees && dist < 7 && Math.abs(p.y - b.position.y) < 1));
         } else {
           // can't get you: roam the building
@@ -1587,6 +1675,8 @@ function makeKiller(def) {
       $('crosshair').style.display = '';
       this.onKillEnd?.();
       player.dead = false; respawn();
+      // the hunt starts over: this one goes too (the director brings them back one at a time)
+      if (!net.client && !this.eventOnly) { this.state = 'cooldown'; this.setEnabled(false); }
       for (const name in this.sounds) if (name !== 'spotted') this.stopSound(name, 1.5);
       // everyone backs off after a kill
       for (const kl of killers) if (kl.ready && kl.enabled) { kl.place(); kl.state = 'cooldown'; kl.timer = 4; }
@@ -1661,7 +1751,7 @@ const sawRunner = makeKiller({
       const o = actx.createOscillator(), f = actx.createBiquadFilter(), g = actx.createGain(), lfo = actx.createOscillator(), lg = actx.createGain();
       o.type = 'sawtooth'; o.frequency.value = 60; f.type = 'lowpass'; f.frequency.value = 1100; g.gain.value = 0;
       lfo.frequency.value = 14; lg.gain.value = 12; lfo.connect(lg).connect(o.frequency);
-      o.connect(f).connect(g).connect(actx.destination); o.start(); lfo.start();
+      o.connect(f).connect(g).connect(bus('monsters')); o.start(); lfo.start();
       this.buzz = { o, g };
     }
     let vol = 0, freq = 60;
@@ -1762,7 +1852,7 @@ function noiseBurst(dur, freq, type = 'lowpass', vol = 0.3, delay = 0) {
   for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2);
   const s = a.createBufferSource(), f = a.createBiquadFilter(), g = a.createGain();
   f.type = type; f.frequency.value = freq; g.gain.value = vol;
-  s.buffer = buf; s.connect(f).connect(g).connect(a.destination); s.start(a.currentTime + delay);
+  s.buffer = buf; s.connect(f).connect(g).connect(bus('effects')); s.start(a.currentTime + delay);
 }
 const thumpSound = () => { noiseBurst(0.12, 300, 'lowpass', 0.5); beep(70, 0.12, 'square', 0.12); };
 const crunchSound = () => { for (let i = 0; i < 4; i++) noiseBurst(0.07, 1800, 'highpass', 0.35, i * 0.07); noiseBurst(0.4, 250, 'lowpass', 0.4); };
@@ -2090,7 +2180,8 @@ const gus = makeKiller({
     const want = this.enabled && this.state !== 'killing' && this.alerted && !player.dead && !shop.isSafe();
     if (!want) { if (!s.paused) s.pause(); return; }
     const p = player.body.position;
-    s.volume = THREE.MathUtils.clamp(1 - Math.hypot(b.x - p.x, b.z - p.z) / 40, 0.1, 1);
+    s.baseVol = THREE.MathUtils.clamp(1 - Math.hypot(b.x - p.x, b.z - p.z) / 40, 0.1, 1);
+    s.volume = Math.min(1, s.baseVol * htmlVol());
     if (s.paused) s.play().catch(() => {});
   },
   killCamera() {
@@ -2138,7 +2229,7 @@ function mimicScreech() {
   o2.frequency.setValueAtTime(393, a.currentTime); o2.frequency.exponentialRampToValueAtTime(930, a.currentTime + 0.35); o2.frequency.exponentialRampToValueAtTime(150, a.currentTime + 1.1);
   f.type = 'bandpass'; f.frequency.value = 1200; f.Q.value = 0.8;
   g.gain.setValueAtTime(0.0001, a.currentTime); g.gain.exponentialRampToValueAtTime(0.25, a.currentTime + 0.05); g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + 1.2);
-  o.connect(f); o2.connect(f); f.connect(g).connect(a.destination);
+  o.connect(f); o2.connect(f); f.connect(g).connect(bus('monsters'));
   o.start(); o2.start(); o.stop(a.currentTime + 1.2); o2.stop(a.currentTime + 1.2);
   noiseBurst(0.9, 2500, 'highpass', 0.12);
 }
@@ -3038,7 +3129,7 @@ const footsteps = {
     const a = audio(), s = a.createBufferSource(), g = a.createGain();
     s.buffer = this.buf; s.playbackRate.value = rate * (0.92 + Math.random() * 0.16);
     g.gain.value = Math.min(1, vol);
-    s.connect(g).connect(a.destination); s.start();
+    s.connect(g).connect(bus('monsters')); s.start();
   },
   // browsers only allow sound after a click or key press, so start the audio on the first one
   unlock() { audio(); if (actx.state === 'suspended') actx.resume(); },
@@ -3093,7 +3184,7 @@ const dread = {
       o.frequency.setValueAtTime(62, now + at); o.frequency.exponentialRampToValueAtTime(34, now + at + 0.16);
       g.gain.setValueAtTime(0.0001, now + at); g.gain.exponentialRampToValueAtTime(vol * v, now + at + 0.015);
       g.gain.exponentialRampToValueAtTime(0.0001, now + at + 0.2);
-      o.connect(g).connect(a.destination); o.start(now + at); o.stop(now + at + 0.25);
+      o.connect(g).connect(bus('ambience')); o.start(now + at); o.stop(now + at + 0.25);
     }
   },
   breath(vol, inhale) {
@@ -3106,7 +3197,7 @@ const dread = {
     s.buffer = this.noise; f.type = 'bandpass'; f.frequency.value = inhale ? 1400 : 800; f.Q.value = 0.9;
     g.gain.setValueAtTime(0.0001, now); g.gain.exponentialRampToValueAtTime(vol, now + len * 0.35);
     g.gain.exponentialRampToValueAtTime(0.0001, now + len);
-    s.connect(f).connect(g).connect(a.destination); s.start(now, Math.random() * 0.4, len);
+    s.connect(f).connect(g).connect(bus('ambience')); s.start(now, Math.random() * 0.4, len);
   },
   update(dt) {
     const want = this.threat();
@@ -3149,7 +3240,7 @@ const bloodMoon = {
   sky: { bg: scene.background.clone(), fog: scene.fog.color.clone(), near: scene.fog.near, far: scene.fog.far, hemi: hemi.color.clone(), ground: hemi.groundColor.clone(), hemiI: hemi.intensity, sun: sun.color.clone(), sunI: sun.intensity },
   red: { bg: new THREE.Color('#5c0707'), fog: new THREE.Color('#6e0909'), near: 3, far: 36, hemi: new THREE.Color('#ff8a78'), ground: new THREE.Color('#4a0a0a'), hemiI: 1.25, sun: new THREE.Color('#ff3a28'), sunI: 1.5 },
   toggle() {
-    if (!this.active && !killers[0].enabled) return toast('Turn the killers on first (K)');
+    if (!this.active && !director.on) return toast('Turn the killers on first (K)');
     if (this.active) this.left = 0; else this.start();
   },
   start() {
@@ -3165,12 +3256,12 @@ const bloodMoon = {
       if (this.active) $('bloodIcon').className = 'on small';
     }
     if (this.active) {
-      if (this.spawnT > 0 && (this.spawnT -= dt) <= 0 && killers[0].enabled && !net.client) {
+      if (this.spawnT > 0 && (this.spawnT -= dt) <= 0 && director.on && !net.client) {
         bloodGus.setEnabled(true); bloodGus.state = 'chase'; bloodGus.timer = 0;
         toast('Blood Moon Gus is hunting you');
       }
       this.left -= dt;
-      if (!killers[0].enabled && !net.client) this.left = 0;
+      if (!director.on && !net.client) this.left = 0;
       // the moon can't set in the middle of its kill
       if (this.left <= 0 && bloodGus.state !== 'killing') {
         this.active = false; this.bannerT = 0;
@@ -3178,7 +3269,7 @@ const bloodMoon = {
         if (bloodGus.enabled) bloodGus.setEnabled(false);
         toast('The blood moon sets');
       }
-    } else if (!net.client && bloodGus.ready && killers[0].enabled && !player.dead && $('start').style.display === 'none' && (this.timer -= dt) <= 0) {
+    } else if (!net.client && bloodGus.ready && director.on && !player.dead && $('start').style.display === 'none' && (this.timer -= dt) <= 0) {
       this.timer = 150 + Math.random() * 90;
       this.start();
     }
@@ -3203,6 +3294,82 @@ const bloodMoon = {
     sun.color.copy(S.sun).lerp(R.sun, k); sun.intensity = S.sunI + (R.sunI - S.sunI) * k;
   },
 };
+
+// ---------------------------------------------------------------- the director: killers come one at a time
+// None at the start. The first one comes after a short while, somewhere away from the spawn room; then one more
+// joins for every 30 m you get from the spawn (the deeper you go, the more of them, the sooner, and a bit faster).
+// Dying puts you back at the start and the hunt starts over. K turns the whole thing off and on.
+const director = {
+  on: true, depth: 0, maxDepth: 0, nextT: 25, speedK: 1, FIRST: 25,
+  pool() { return killers.filter(k => !k.eventOnly && k.ready); },
+  // how far the deepest player has got from the spawn
+  measure() {
+    let d = player.dead ? 0 : player.body.position.distanceTo(SPAWN);
+    if (net.host) for (const r of net.remotes.values()) if (r.s && !r.s.dead) d = Math.max(d, Math.hypot(r.s.x - SPAWN.x, r.s.y - SPAWN.y, r.s.z - SPAWN.z));
+    return d;
+  },
+  level() { return Math.min(this.pool().length, 1 + Math.floor(this.maxDepth / 30)); },
+  update(dt) {
+    if (!ready || net.client) return;
+    const pool = this.pool();
+    for (const k of pool) if (!k.dirSeen) { k.dirSeen = true; if (k.enabled) k.setEnabled(false); }   // wait for their turn
+    this.depth = this.measure();
+    this.maxDepth = Math.max(this.maxDepth, this.depth);
+    this.speedK = 1 + Math.min(0.25, this.maxDepth / 400);
+    this.hud();
+    if (!this.on || player.dead || $('start').style.display !== 'none') return;
+    const active = pool.filter(k => k.enabled);
+    if (active.length >= this.level()) return;
+    if ((this.nextT -= dt) > 0) return;
+    const waiting = pool.filter(k => !k.enabled && k.state !== 'killing' && k.state !== 'remote');
+    if (!waiting.length) return;
+    const kl = waiting[Math.floor(Math.random() * waiting.length)];
+    kl.setEnabled(true);
+    kl.playSound('spotted', 0.35);    // heard far off: something is coming
+    (net.host ? m => net.toastAll(m) : toast)('The ' + kl.name + ' is hunting you');
+    this.nextT = Math.max(8, 30 - this.maxDepth / 6);
+  },
+  reset() {
+    this.maxDepth = 0; this.nextT = this.FIRST;
+    if (net.client) return;
+    for (const k of this.pool()) if (k.enabled && k.state !== 'killing') k.setEnabled(false);
+  },
+  toggle() {
+    this.on = !this.on;
+    if (!this.on) for (const k of killers) if (k.ready && k.enabled && k.state !== 'killing') k.setEnabled(false);
+    else this.nextT = Math.min(this.nextT, 3);
+    return this.on;
+  },
+  hud() {
+    const t = this.on ? 'Depth ' + Math.round(this.depth) + ' m · Danger ' + this.level() : 'Killers off';
+    if ($('danger').textContent !== t) $('danger').textContent = t;
+  },
+};
+
+// ---------------------------------------------------------------- sound settings (P, or SOUND on the start screen)
+const soundPanel = {
+  open: false,
+  show(on) {
+    this.open = on;
+    $('soundPanel').style.display = on ? 'block' : 'none';
+    menuOpen = on;
+    if (on) {
+      if (document.pointerLockElement) document.exitPointerLock();
+      $('start').style.display = 'none';
+      for (const c of VOL_CATS) $('vol_' + c).value = Math.round(volume[c] * 100);
+      $('volMute').checked = volume.muted;
+      this.labels();
+    } else if (ready) { if (unlockedPlay) locked = true; else lockPointer(); }
+  },
+  labels() { for (const c of VOL_CATS) $('volv_' + c).textContent = Math.round(volume[c] * 100) + '%'; },
+};
+for (const c of VOL_CATS) $('vol_' + c).addEventListener('input', e => {
+  volume[c] = e.target.value / 100; applyVolume(); soundPanel.labels();
+  if (c !== 'monsters' && c !== 'ambience') beep(520, 0.08, 'sine', 0.08);   // a test blip at the new level
+});
+$('volMute').addEventListener('change', e => { volume.muted = e.target.checked; applyVolume(); });
+$('soundClose').addEventListener('click', () => soundPanel.show(false));
+$('soundOpen').addEventListener('click', e => { e.stopPropagation(); if (ready) soundPanel.show(true); });
 
 // ---------------------------------------------------------------- security cameras (the Lethal Ape camera model)
 // Up on the walls around the building. Each one sweeps left and right; when it sees you it stops, turns to follow
@@ -3375,7 +3542,7 @@ const net = {
       const r = this.remotes.get(c.peer); if (r) { r.s = m.s; r.seen = performance.now(); }
     } else if (m.t === 'cmd') {
       const who = this.remotes.get(c.peer)?.look.name || 'Someone';
-      if (m.c === 'KeyK') { const on = !killers[0].enabled; killers.forEach(kl => { if (!kl.eventOnly) kl.setEnabled(on); }); this.toastAll(who + (on ? ' turned the killers on' : ' turned the killers off')); }
+      if (m.c === 'KeyK') { const on = director.toggle(); this.toastAll(who + (on ? ' turned the killers on' : ' turned the killers off')); }
       if (m.c === 'KeyB') { bloodMoon.toggle(); this.toastAll(who + ' pressed the blood moon'); }
     }
   },
@@ -3618,7 +3785,9 @@ function frame() {
   vr.input(dt);
   updatePlayer(dt);
   tools.preStep();
+  antiTunnel.before();
   world.step(1 / 60, dt, 4);
+  antiTunnel.after();
   perf.physics = performance.now() - t0;
   for (const p of props.slice()) { syncProp(p); if (p.body.position.y < FALL_Y) removeProp(p, false); }
   updateEffects(dt);
@@ -3631,6 +3800,7 @@ function frame() {
   footsteps.update(dt);
   dread.update(dt);
   bloodMoon.update(dt);
+  director.update(dt);
   secCams.update(dt);
   net.update(dt);
   stick.update(dt);
@@ -3652,9 +3822,8 @@ function frame() {
 // put a prop on a walk-graph node (standing on the floor), optionally turned
 function placePropAt(kind, nd, yaw = 0) {
   const p = makeProp(kind); if (!p) return null;
-  const bb = new THREE.Box3().setFromObject(p.mesh);
-  p.body.position.set(nd.x, nd.y + (bb.max.y - bb.min.y) / 2 + 0.05, nd.z);
   p.body.quaternion.setFromEuler(0, yaw, 0);
+  p.body.position.set(nd.x, nd.y + propHalfHeight(p) + 0.05, nd.z);
   syncProp(p);
   return p;
 }
@@ -3699,7 +3868,7 @@ Promise.all([loadApe(), loadMap(), loadPropModels()]).then(() => computer.load()
   coinPickups.spawnAll(30);
   updateCoins();
   if (save.owned.includes('stick')) giveStickTool();
-  window.__ape = { rig, player, props, apeRoot, camera, tools, killers, shop, save, stick, nav, perf, computer, footsteps, dread, pad, ragdolls, bloodMoon, touch, vr, xrRig, secCams, hats, net };
+  window.__ape = { rig, player, props, apeRoot, camera, tools, killers, shop, save, stick, nav, perf, computer, footsteps, dread, pad, ragdolls, bloodMoon, touch, vr, xrRig, secCams, hats, net, director, volume, applyVolume, soundPanel, antiTunnel };
   net.autoJoin();
   const extras = stick.load().then(() => shop.attachStick()).catch(err => { console.error(err); toast('Stick failed to load: ' + err.message); });
   const cams = secCams.load().then(() => secCams.placeAll()).catch(err => { console.error(err); toast('Cameras failed to load: ' + err.message); });
