@@ -1017,7 +1017,8 @@ addEventListener('wheel', e => { if (locked) tools.wheel(e.deltaY); }, { passive
 addEventListener('contextmenu', e => e.preventDefault());
 addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT') {             // typing a name on the computer: no game keys
-    if (e.code === 'Enter') computer.setName();
+    if (e.code === 'Enter' && e.target.id === 'pcName') computer.setName();
+    if (e.code === 'Enter' && e.target.id === 'netCode') net.joinFromPanel();
     if (e.code === 'Escape') computer.close();
     return;
   }
@@ -1028,13 +1029,16 @@ addEventListener('keydown', e => {
     if (killers.some(kl => kl.state === 'killing')) { killThird = !killThird; toast(killThird ? 'Watching the kill in third person' : 'Back in your eyes'); }
     else player.thirdPerson = !player.thirdPerson;
   }
-  if (e.code === 'KeyK') { const on = !killers[0].enabled; killers.forEach(kl => { if (!kl.eventOnly) kl.setEnabled(on); }); toast(on ? 'The killers are hunting you' : 'Killers gone'); }
-  if (e.code === 'KeyB' && ready) bloodMoon.toggle();
+  if ((e.code === 'KeyK' || e.code === 'KeyB') && net.client && ready) { net.send({ t: 'cmd', c: e.code }); toast('Asked the host'); }
+  else if (e.code === 'KeyK') { const on = !killers[0].enabled; killers.forEach(kl => { if (!kl.eventOnly) kl.setEnabled(on); }); toast(on ? 'The killers are hunting you' : 'Killers gone'); }
+  else if (e.code === 'KeyB' && ready) bloodMoon.toggle();
+  if (e.code === 'KeyO' && ready && !shop.open && !computer.open) net.openPanel(true);
   if (e.code === 'KeyH') $('hint').style.display = $('hint').style.display === 'none' ? '' : 'none';
   if (e.code.startsWith('Digit')) { const i = +e.code.slice(5) - 1; if (i >= 0 && i < tools.list.length) tools.select(i); }
   if (e.code === 'KeyE' && tools.grab && tools.grab.mode === 'phys') tools.rotating = true;
   else if (e.code === 'KeyE' && !menuOpen && !player.dead) { if (computer.near()) computer.openPanel(); else shop.talk(); }
   if (e.code === 'Escape' && shop.open) shop.close();
+  if (e.code === 'Escape' && net.panelOpen) net.openPanel(false);
   if (e.code === 'Escape' && computer.open) computer.close();
   if (e.code === 'KeyR') { const p = propOf(aimHit()); if (p && p.frozen) { setFrozen(p, false); toast('Unfrozen'); } }
   if (e.code === 'KeyZ') {
@@ -1326,9 +1330,9 @@ function makeKiller(def) {
       };
       step();
     },
-    canSee() {
+    canSee(at = apeRoot.position) {
       const b = this.body.position;
-      const eye = _v2.set(b.x, b.y + this.eyeHeight, b.z), to = _v3.copy(apeRoot.position); to.y += 1.2;
+      const eye = _v2.set(b.x, b.y + this.eyeHeight, b.z), to = _v3.set(at.x, at.y + 1.2, at.z);
       const d = eye.distanceTo(to);
       camRay.set(eye, to.sub(eye).normalize()); camRay.far = d;
       return camRay.intersectObjects(staticMeshes, false).length === 0;
@@ -1431,8 +1435,12 @@ function makeKiller(def) {
       if (!this.ready) return;
       this.updateBuzz?.();
       if (this.state === 'killing') return this.updateKill(dt);
+      if (net.client) return this.netUpdate(dt);      // online and not the host: the host's killers, copied
+      if (this.state === 'remote') return this.updateRemoteKill(dt);
       if (!this.enabled) return;
-      const b = this.body, p = player.body.position;
+      // online host: go for the closest player who can be reached (you or someone who joined)
+      const T = net.host ? net.pickTarget(this.body.position) : null;
+      const b = this.body, p = T ? T.p : player.body.position;
       this.mixer.update(dt);
       this.timer -= dt;
       const dx = p.x - b.position.x, dz = p.z - b.position.z, dist = Math.hypot(dx, dz);
@@ -1444,10 +1452,10 @@ function makeKiller(def) {
         speed = 1.5; dir.copy(this.steer(p, dt, false)); this.moveAnim(speed);
         if (this.timer <= 0) this.state = 'chase';
       } else {
-        const canReach = !player.dead && !shop.isSafe();
+        const canReach = T ? T.reach : !player.dead && !shop.isSafe();
         if (canReach) {
           // it spots you: sound, then sprint
-          const sees = dist < this.seeRange && this.canSee();
+          const sees = dist < this.seeRange && this.canSee(p);
           if (!this.alerted && (sees || this.alwaysKnows)) {
             this.alerted = true;
             this.playSound('spotted', Math.max(0.2, 1 - dist / 40));   // still heard when it spots you from far off
@@ -1471,10 +1479,11 @@ function makeKiller(def) {
         }
         if (this.sideT > 0) { this.sideT -= dt; dir.applyAxisAngle(new V3(0, 1, 0), this.sideDir * Math.PI / 2.2); }
         this.moveAnim(speed);
-        if (canReach && dist < this.killRange && Math.abs(p.y - b.position.y) < 1.8) return this.startKill();
+        if (canReach && dist < this.killRange && Math.abs(p.y - b.position.y) < 1.8) return T && !T.local ? this.startRemoteKill(T.id) : this.startKill();
       }
 
       if (this.holdT > 0) { this.holdT -= dt; speed = 0; }   // e.g. stopping to roar
+      this.netSpeed = speed;
       const k = 1 - Math.exp(-this.accel * dt);
       b.velocity.x += (dir.x * speed - b.velocity.x) * k;
       b.velocity.z += (dir.z * speed - b.velocity.z) * k;
@@ -1487,6 +1496,45 @@ function makeKiller(def) {
       this.holder.position.set(b.position.x, b.position.y, b.position.z);
       this.holder.rotation.y = this.yaw;   // all killer models face +Z
       this.animate?.(dt, Math.hypot(b.velocity.x, b.velocity.z));
+    },
+
+    // online host: a killer reached someone who joined. They watch the kill on their screen; here it stands still, hidden, until it's over
+    startRemoteKill(id) {
+      this.state = 'remote'; this.timer = (this.kill?.duration ?? 3) + 1;
+      this.body.velocity.set(0, 0, 0); this.holder.visible = false; this.netSpeed = 0;
+      this.stopSound('spotted');
+      net.killed(id, this);
+    },
+    updateRemoteKill(dt) {
+      this.body.velocity.x = this.body.velocity.z = 0;
+      if ((this.timer -= dt) > 0) return;
+      this.holder.visible = this.enabled; this.place(); this.state = 'cooldown'; this.timer = 4;
+    },
+    // online, not the host: stand where the host's copy is, play its walk and its sounds
+    netUpdate(dt) {
+      const s = this.netS;
+      if (!s) return;
+      if (!!s.en !== this.enabled) this.setEnabled(!!s.en);
+      if (!this.enabled) return;
+      const b = this.body, k = 1 - Math.exp(-12 * dt);
+      b.position.x += (s.x - b.position.x) * k; b.position.z += (s.z - b.position.z) * k;
+      if (Math.abs(s.y - b.position.y) > 3) b.position.y = s.y; else b.position.y += (s.y - b.position.y) * k;
+      b.velocity.set(s.vx, 0, s.vz);
+      let d = s.yaw - this.yaw; d = Math.atan2(Math.sin(d), Math.cos(d)); this.yaw += d * k;
+      this.state = s.st;
+      if (s.al && !this.alerted) {
+        const p = player.body.position;
+        this.playSound('spotted', Math.max(0.2, 1 - Math.hypot(p.x - b.position.x, p.z - b.position.z) / 40));
+        this.onSpot?.();
+      }
+      this.alerted = !!s.al;
+      this.mixer.update(dt);
+      this.moveAnim(s.sp);
+      if (this.state === 'stunned' && this.current) this.current.timeScale = 0.15;
+      this.holder.position.set(b.position.x, b.position.y, b.position.z);
+      this.holder.rotation.y = this.yaw;
+      this.animate?.(dt, Math.hypot(s.vx, s.vz));
+      this.holder.visible = !!s.vis;
     },
 
     startKill() {
@@ -3117,12 +3165,12 @@ const bloodMoon = {
       if (this.active) $('bloodIcon').className = 'on small';
     }
     if (this.active) {
-      if (this.spawnT > 0 && (this.spawnT -= dt) <= 0 && killers[0].enabled) {
+      if (this.spawnT > 0 && (this.spawnT -= dt) <= 0 && killers[0].enabled && !net.client) {
         bloodGus.setEnabled(true); bloodGus.state = 'chase'; bloodGus.timer = 0;
         toast('Blood Moon Gus is hunting you');
       }
       this.left -= dt;
-      if (!killers[0].enabled) this.left = 0;
+      if (!killers[0].enabled && !net.client) this.left = 0;
       // the moon can't set in the middle of its kill
       if (this.left <= 0 && bloodGus.state !== 'killing') {
         this.active = false; this.bannerT = 0;
@@ -3130,7 +3178,7 @@ const bloodMoon = {
         if (bloodGus.enabled) bloodGus.setEnabled(false);
         toast('The blood moon sets');
       }
-    } else if (bloodGus.ready && killers[0].enabled && !player.dead && $('start').style.display === 'none' && (this.timer -= dt) <= 0) {
+    } else if (!net.client && bloodGus.ready && killers[0].enabled && !player.dead && $('start').style.display === 'none' && (this.timer -= dt) <= 0) {
       this.timer = 150 + Math.random() * 90;
       this.start();
     }
@@ -3261,6 +3309,303 @@ const secCams = {
   },
 };
 
+// ---------------------------------------------------------------- online: play with friends
+// One player hosts and gets a room code; friends type it in (or open the ?join= link). Everyone sees everyone's ape
+// (name, colour, face, hat, every arm and head move) and the host's killers hunt all of you: the closest player
+// they can reach. Connections are peer to peer (WebRTC through the free PeerJS server), so no game server is needed.
+const NET_PREFIX = 'apesbx-';
+const NET_KILL_STATES = ['cooldown', 'chase', 'stunned', 'killing', 'remote'];
+const r2 = v => Math.round(v * 100) / 100, r3 = v => Math.round(v * 1000) / 1000;
+const net = {
+  peer: null, host: false, client: false, code: '', conns: new Map(), hostConn: null, myId: '',
+  remotes: new Map(), sendT: 0, lookT: 0, lookJSON: '', panelOpen: false, roster: [],
+  get on() { return this.host || this.client; },
+  async lib() {
+    if (!this.Peer) this.Peer = (await import('https://cdn.jsdelivr.net/npm/peerjs@1.5.4/+esm')).Peer;
+    return this.Peer;
+  },
+  look() { return { name: save.name || 'GORILLA', color: save.color || [9, 9, 9], face: save.face || 0, hat: save.hat ?? -1 }; },
+  status(text) { $('netStatus').textContent = text; },
+  // ---- hosting
+  async hostGame() {
+    if (this.on || this.busy) return;
+    this.busy = true;
+    this.status('Making a room…');
+    const Peer = await this.lib().catch(() => null);
+    if (!Peer) { this.busy = false; return this.status('Could not load the online code (no internet?)'); }
+    const code = Array.from({ length: 5 }, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[Math.floor(Math.random() * 32)]).join('');
+    const peer = this.peer = new Peer(NET_PREFIX + code);
+    peer.on('open', () => {
+      this.busy = false;
+      this.host = true; this.code = code; this.myId = 'host';
+      this.status('Room open. Tell your friends the code.');
+      this.lookJSON = JSON.stringify(this.look());
+      this.sendRoster();
+      toast('Room ' + code + ' is open');
+    });
+    peer.on('connection', c => this.addClient(c));
+    peer.on('error', err => {
+      console.warn('[net]', err);
+      if (this.host) return;
+      this.busy = false; peer.destroy(); this.peer = null;
+      if (err.type === 'unavailable-id') return this.hostGame();
+      this.status('Could not open a room: ' + err.type);
+    });
+  },
+  addClient(c) {
+    c.on('open', () => { this.conns.set(c.peer, c); });
+    c.on('data', m => this.onHostData(c, m));
+    const gone = () => {
+      if (!this.conns.has(c.peer)) return;
+      const r = this.remotes.get(c.peer);
+      this.conns.delete(c.peer);
+      if (r) toast(r.look.name + ' left');
+      this.removeRemote(c.peer);
+      this.sendRoster();
+    };
+    c.on('close', gone); c.on('error', gone);
+  },
+  onHostData(c, m) {
+    if (m.t === 'hi') {
+      const isNew = !this.remotes.has(c.peer);
+      this.setRemote(c.peer, m.look);
+      if (isNew) this.toastAll(m.look.name + ' joined');
+      this.sendRoster();
+    } else if (m.t === 'p') {
+      const r = this.remotes.get(c.peer); if (r) { r.s = m.s; r.seen = performance.now(); }
+    } else if (m.t === 'cmd') {
+      const who = this.remotes.get(c.peer)?.look.name || 'Someone';
+      if (m.c === 'KeyK') { const on = !killers[0].enabled; killers.forEach(kl => { if (!kl.eventOnly) kl.setEnabled(on); }); this.toastAll(who + (on ? ' turned the killers on' : ' turned the killers off')); }
+      if (m.c === 'KeyB') { bloodMoon.toggle(); this.toastAll(who + ' pressed the blood moon'); }
+    }
+  },
+  sendRoster() {
+    const list = [{ id: 'host', look: this.look() }, ...[...this.remotes].map(([id, r]) => ({ id, look: r.look }))];
+    this.roster = list;
+    for (const c of this.conns.values()) if (c.open) c.send({ t: 'roster', list });
+    this.showRoom();
+  },
+  toastAll(text) { toast(text); for (const c of this.conns.values()) if (c.open) c.send({ t: 'toast', text }); },
+  // a killer reached someone who joined: their screen plays the kill
+  killed(id, kl) {
+    const r = this.remotes.get(id), c = this.conns.get(id);
+    if (r) { r.dead = true; if (r.s) r.s.dead = 1; }
+    if (c?.open) c.send({ t: 'die', k: killers.indexOf(kl) });
+    this.toastAll((r ? r.look.name : 'Someone') + ' got caught by the ' + kl.name);
+  },
+  // the closest player a killer can get to (you, or anyone who joined)
+  pickTarget(from) {
+    const me = { p: player.body.position, local: true, reach: !player.dead && !shop.isSafe() };
+    let best = me.reach ? me : null, bestD = best ? Math.hypot(me.p.x - from.x, me.p.z - from.z) : Infinity;
+    for (const [id, r] of this.remotes) {
+      if (!r.s || r.s.dead || r.s.safe || r.dead) continue;
+      const d = Math.hypot(r.s.x - from.x, r.s.z - from.z);
+      if (d < bestD) { bestD = d; best = { p: { x: r.s.x, y: r.s.y, z: r.s.z }, local: false, id, reach: true }; }
+    }
+    return best || me;
+  },
+  // ---- joining
+  async join(code) {
+    code = (code || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!code) return this.status('Type the room code first');
+    if (this.on || this.busy) return;
+    this.busy = true;
+    this.status('Joining ' + code + '…');
+    const Peer = await this.lib().catch(() => null);
+    if (!Peer) { this.busy = false; return this.status('Could not load the online code (no internet?)'); }
+    const peer = this.peer = new Peer();
+    const fail = msg => { this.busy = false; this.leave(true); this.status(msg); };
+    peer.on('open', id => {
+      this.myId = id;
+      const c = this.hostConn = peer.connect(NET_PREFIX + code, { reliable: true });
+      const timer = setTimeout(() => { if (!this.client) fail('No room with code ' + code); }, 15000);
+      c.on('open', () => {
+        clearTimeout(timer);
+        this.busy = false; this.client = true; this.code = code; this.hostSeen = performance.now();
+        c.send({ t: 'hi', look: this.look() }); this.lookJSON = JSON.stringify(this.look());
+        this.status('Joined room ' + code);
+        toast('Joined room ' + code + ': the host\'s killers hunt everyone');
+        for (const kl of killers) kl.netS = null;
+        this.showRoom();
+        setTimeout(() => { if (this.panelOpen) this.openPanel(false); }, 1200);
+      });
+      c.on('data', m => this.onClientData(m));
+      c.on('close', () => { if (this.client) { toast('The host left the game'); this.leave(); } });
+    });
+    peer.on('error', err => {
+      console.warn('[net]', err);
+      if (this.client) return;
+      fail(err.type === 'peer-unavailable' ? 'No room with code ' + code : 'Could not join: ' + err.type);
+    });
+  },
+  joinFromPanel() { this.join($('netCode').value); },
+  onClientData(m) {
+    if (m.t === 'roster') {
+      this.roster = m.list;
+      const ids = new Set(m.list.map(e => e.id));
+      for (const id of [...this.remotes.keys()]) if (!ids.has(id)) this.removeRemote(id);
+      for (const e of m.list) if (e.id !== this.myId) this.setRemote(e.id, e.look);
+      this.showRoom();
+    } else if (m.t === 's') {
+      this.hostSeen = performance.now();
+      for (const id in m.ps) { const r = this.remotes.get(id); if (r && id !== this.myId) r.s = m.ps[id]; }
+      m.ks.forEach((k, i) => {
+        const kl = killers[i]; if (!kl) return;
+        kl.netS = k ? { en: k[0], x: k[1], y: k[2], z: k[3], yaw: k[4], sp: k[5], st: NET_KILL_STATES[k[6]] || 'chase', al: k[7], vis: k[8], vx: k[9], vz: k[10] } : null;
+      });
+      if (m.moon && !bloodMoon.active) bloodMoon.start();
+      else if (!m.moon && bloodMoon.active) bloodMoon.left = 0;
+    } else if (m.t === 'die') {
+      const kl = killers[m.k];
+      if (kl && kl.ready && !player.dead && kl.state !== 'killing') kl.startKill();
+    } else if (m.t === 'toast') toast(m.text);
+  },
+  send(m) { if (this.hostConn?.open) this.hostConn.send(m); },
+  leave(quiet) {
+    const wasClient = this.client;
+    this.host = this.client = false; this.code = '';
+    for (const c of this.conns.values()) c.close();
+    this.conns.clear();
+    this.hostConn = null;
+    if (this.peer) { this.peer.destroy(); this.peer = null; }
+    for (const id of [...this.remotes.keys()]) this.removeRemote(id);
+    this.roster = [];
+    if (wasClient) for (const kl of killers) if (kl.ready && kl.state !== 'killing') { kl.netS = null; if (kl.enabled) { kl.place(); kl.state = 'cooldown'; kl.timer = 3; } }
+    if (!quiet) this.status('Playing alone');
+    this.showRoom();
+  },
+  // ---- other players' apes
+  setRemote(id, look) {
+    let r = this.remotes.get(id);
+    if (!r) {
+      const root = new THREE.Group(), body = new THREE.Group(); root.add(body);
+      const ape = SkeletonUtils.clone(apeSource);
+      ape.traverse(o => { if (o.isMesh) o.material = Array.isArray(o.material) ? o.material.map(m => m.clone()) : o.material.clone(); });
+      body.add(ape);
+      const R = buildRig(ape, root);                 // same bones in the same order as mine
+      const bones = [...R.local0.keys()];
+      const hat = ape.getObjectByName('hatHolder');  // the copy brings a hat holder along from my ape
+      if (hat) { hat.clear(); hat.visible = true; }   // (mine is hidden in first person)
+      const tc = document.createElement('canvas'); tc.width = 512; tc.height = 96;
+      const tag = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(tc), depthWrite: false }));
+      tag.material.map.colorSpace = THREE.SRGBColorSpace; tag.userData.canvas = tc;
+      tag.scale.set(1.6, 0.3, 1); tag.position.y = APE_HEIGHT + 0.45;
+      root.add(tag);
+      root.visible = false;
+      scene.add(root);
+      r = { id, root, body, ape, bones, hat, tag, s: null, look: null, hatShown: -2 };
+      this.remotes.set(id, r);
+    }
+    if (JSON.stringify(look) === JSON.stringify(r.look)) return;
+    r.look = look;
+    const col = rgbOf(look.color);
+    r.ape.traverse(o => { if (o.isMesh) for (const m of [].concat(o.material)) if (!/_2$/.test(m.name)) m.color.copy(col); });
+    setFace(r.ape, look.face);
+    const tc = r.tag.userData.canvas, g = tc.getContext('2d');
+    g.clearRect(0, 0, tc.width, tc.height);
+    g.font = 'bold 64px sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.lineWidth = 10; g.strokeStyle = '#000'; g.strokeText(look.name, 256, 50);
+    g.fillStyle = '#fff'; g.fillText(look.name, 256, 50);
+    r.tag.material.map.needsUpdate = true;
+    r.hatShown = -2;
+  },
+  removeRemote(id) {
+    const r = this.remotes.get(id); if (!r) return;
+    scene.remove(r.root);
+    r.root.traverse(o => { if (o.isMesh || o.isSprite) [].concat(o.material).forEach(m => m.dispose()); });
+    this.remotes.delete(id);
+  },
+  // my ape, packed small
+  myState() {
+    const p = player.body.position, q = [];
+    for (const b of rig.local0.keys()) q.push(r3(b.quaternion.x), r3(b.quaternion.y), r3(b.quaternion.z), r3(b.quaternion.w));
+    return {
+      x: r2(p.x), y: r2(p.y), z: r2(p.z), yaw: r3(player.faceYaw),
+      by: r3(apeBody.position.y), bx: r3(apeBody.rotation.x), bz: r3(apeBody.rotation.z), q,
+      dead: player.dead ? 1 : 0, safe: shop.isSafe() ? 1 : 0, vis: apeRoot.visible && !player.dead ? 1 : 0,
+    };
+  },
+  // 15 times a second on its own timer, so it keeps going (slower) while the game's tab is hidden
+  tick() {
+    if (!this.on || !ready) return;
+    // my look changed (computer, shop): tell the others
+    if ((this.lookT -= 1 / 15) <= 0) {
+      this.lookT = 1;
+      const j = JSON.stringify(this.look());
+      if (j !== this.lookJSON) { this.lookJSON = j; if (this.client) this.send({ t: 'hi', look: this.look() }); else this.sendRoster(); }
+    }
+    {
+      const me = this.myState();
+      if (this.client) this.send({ t: 'p', s: me });
+      else if (this.conns.size) {
+        const ps = { host: me };
+        for (const [id, r] of this.remotes) if (r.s) ps[id] = r.s;
+        const ks = killers.map(kl => kl.ready ? [kl.enabled ? 1 : 0, r2(kl.body.position.x), r2(kl.body.position.y), r2(kl.body.position.z), r3(kl.yaw),
+          r2(kl.netSpeed || 0), Math.max(0, NET_KILL_STATES.indexOf(kl.state)), kl.alerted ? 1 : 0, kl.holder.visible ? 1 : 0, r2(kl.body.velocity.x), r2(kl.body.velocity.z)] : null);
+        const msg = { t: 's', ps, ks, moon: bloodMoon.active ? 1 : 0 };
+        for (const c of this.conns.values()) if (c.open) c.send(msg);
+      }
+    }
+    // nothing heard for a while: they closed the game without saying bye
+    const now = performance.now();
+    if (this.client && now - this.hostSeen > 20000) { toast('Lost the host'); this.leave(); return; }
+    if (this.host) for (const [id, r] of [...this.remotes]) if (r.seen && now - r.seen > 20000) { this.conns.get(id)?.close(); this.conns.delete(id); toast(r.look.name + ' left'); this.removeRemote(id); this.sendRoster(); }
+  },
+  update(dt) {
+    if (!this.on) return;
+    // move the other apes toward where they are
+    const k = 1 - Math.exp(-14 * dt);
+    for (const r of this.remotes.values()) {
+      const s = r.s;
+      if (!s) continue;
+      if (r.dead && !s.dead) r.dead = false;
+      const R = r.root;
+      if (!R.visible || R.position.distanceTo(_v1.set(s.x, s.y, s.z)) > 6) R.position.set(s.x, s.y, s.z);
+      else R.position.lerp(_v1.set(s.x, s.y, s.z), k);
+      let d = s.yaw - R.rotation.y; d = Math.atan2(Math.sin(d), Math.cos(d)); R.rotation.y += d * k;
+      r.body.position.y += (s.by - r.body.position.y) * k;
+      r.body.rotation.x += (s.bx - r.body.rotation.x) * k; r.body.rotation.z += (s.bz - r.body.rotation.z) * k;
+      for (let i = 0; i < r.bones.length && i * 4 + 3 < s.q.length; i++)
+        r.bones[i].quaternion.slerp(_q1.set(s.q[i * 4], s.q[i * 4 + 1], s.q[i * 4 + 2], s.q[i * 4 + 3]), k);
+      R.visible = !!s.vis;
+      if (r.hat && hats.loaded && r.hatShown !== r.look.hat) {
+        r.hatShown = r.look.hat; r.hat.clear();
+        if (r.look.hat >= 0 && hats.templates[r.look.hat]) r.hat.add(hats.templates[r.look.hat].clone());
+      }
+    }
+  },
+  // ---- the panel (O key, or the button on the start screen)
+  openPanel(on) {
+    this.panelOpen = on;
+    $('netPanel').style.display = on ? 'block' : 'none';
+    menuOpen = on;
+    if (on) { if (document.pointerLockElement) document.exitPointerLock(); $('start').style.display = 'none'; this.showRoom(); }
+    else if (ready) { if (unlockedPlay) locked = true; else lockPointer(); }
+  },
+  showRoom() {
+    const on = this.on;
+    $('netStart').style.display = on ? 'none' : '';
+    $('netRoom').style.display = on ? '' : 'none';
+    $('netCodeBig').textContent = this.code;
+    $('netLink').textContent = this.host ? location.origin + location.pathname + '?join=' + this.code : '';
+    $('netCopy').style.display = this.host ? '' : 'none';
+    $('netPlayers').innerHTML = this.roster.map(e => '<div>' + (e.id === 'host' ? '👑 ' : '🦍 ') + String(e.look.name).replace(/[<>&"]/g, '') + (e.id === this.myId ? ' (you)' : '') + '</div>').join('');
+    $('netBadge').style.display = on ? '' : 'none';
+    $('netBadge').textContent = on ? 'ONLINE · ' + this.code + ' · ' + Math.max(1, this.roster.length) + (this.roster.length === 1 ? ' player' : ' players') + ' · O' : '';
+  },
+  autoJoin() {
+    const code = new URLSearchParams(location.search).get('join');
+    if (code) { $('netCode').value = code.toUpperCase(); this.openPanel(true); this.join(code); }
+  },
+};
+$('netHost').addEventListener('click', () => net.hostGame());
+$('netJoin').addEventListener('click', () => net.joinFromPanel());
+$('netLeave').addEventListener('click', () => { net.leave(); toast('Playing alone again'); });
+$('netClose').addEventListener('click', () => net.openPanel(false));
+$('netCopy').addEventListener('click', () => { navigator.clipboard?.writeText($('netLink').textContent).then(() => toast('Link copied')).catch(() => {}); });
+setInterval(() => net.tick(), 1000 / 15);
+$('netOpen').addEventListener('click', e => { e.stopPropagation(); if (ready) net.openPanel(true); });
+
 // ---------------------------------------------------------------- main loop
 let ready = false;
 const clock = new THREE.Clock();
@@ -3287,6 +3632,7 @@ function frame() {
   dread.update(dt);
   bloodMoon.update(dt);
   secCams.update(dt);
+  net.update(dt);
   stick.update(dt);
   shop.update(dt, time);
   if (computer.tag) computer.tag.visible = player.thirdPerson && apeRoot.visible;   // your own name: third person only
@@ -3353,7 +3699,8 @@ Promise.all([loadApe(), loadMap(), loadPropModels()]).then(() => computer.load()
   coinPickups.spawnAll(30);
   updateCoins();
   if (save.owned.includes('stick')) giveStickTool();
-  window.__ape = { rig, player, props, apeRoot, camera, tools, killers, shop, save, stick, nav, perf, computer, footsteps, dread, pad, ragdolls, bloodMoon, touch, vr, xrRig, secCams, hats };
+  window.__ape = { rig, player, props, apeRoot, camera, tools, killers, shop, save, stick, nav, perf, computer, footsteps, dread, pad, ragdolls, bloodMoon, touch, vr, xrRig, secCams, hats, net };
+  net.autoJoin();
   const extras = stick.load().then(() => shop.attachStick()).catch(err => { console.error(err); toast('Stick failed to load: ' + err.message); });
   const cams = secCams.load().then(() => secCams.placeAll()).catch(err => { console.error(err); toast('Cameras failed to load: ' + err.message); });
   const hatsReady = hats.load().then(() => hats.wearAll()).catch(err => { console.error(err); toast('Hats failed to load: ' + err.message); });
