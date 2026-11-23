@@ -1769,6 +1769,7 @@ const sawRunner = makeKiller({
 const lethalApe = makeKiller({
   name: 'Lethal Ape',
   ragdoll: true,
+  seeRange: 4525,      // spots you from anywhere it has a clear view (and never loses you once it has)
   soundFiles: { spotted: 'assets/sounds/ape_yell.mp3', splatter: 'assets/sounds/ape_splatter.mp3' },
   walkSpeed: 2.6, chaseSpeed: 6.8, killRange: 2.1, eyeHeight: 2.6,
   bodySpheres: [[0.6, 0.6], [0.6, 1.6], [0.5, 2.5]],
