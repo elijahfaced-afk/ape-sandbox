@@ -1688,7 +1688,7 @@ function makeKiller(def) {
 // ---- 1. Saw Runner: Walk/Run animations, kill scene with a camera in the victim's head
 const sawRunner = makeKiller({
   name: 'Saw Runner',
-  seeRange: 60,
+  seeRange: 42,
   soundFiles: { spotted: 'assets/sounds/spotted.mp3', kill: 'assets/sounds/kill.mp3' },
   buzz: null,
   async load() {
@@ -2118,6 +2118,7 @@ const ragdolls = {
 const GUS_HEIGHT = 2.9;
 const gus = makeKiller({
   name: 'Gus',
+  seeRange: 42,
   soundFiles: { spotted: 'assets/sounds/gus_scream.mp3', gruesome: 'assets/sounds/gus_gruesome.mp3', k096: 'assets/sounds/gus_096.mp3' },
   walkSpeed: 2.8, chaseSpeed: 7.0, killRange: 2.2, eyeHeight: 2.4,
   bodySpheres: [[0.55, 0.55], [0.55, 1.5], [0.45, 2.3]],
