@@ -1746,7 +1746,7 @@ const bladeApe = makeKiller({
   name: 'Blade Ape',
   seeRange: 81,
   soundFiles: { spotted: 'assets/sounds/blade_scream.mp3', splatter: 'assets/sounds/blade_splatter.mp3', death: 'assets/sounds/blade_death.mp3' },
-  walkSpeed: 14, chaseSpeed: 30, accel: 20, killRange: 2.2, eyeHeight: 1.4,
+  walkSpeed: 3.0, chaseSpeed: 7.2, accel: 8, killRange: 2.2, eyeHeight: 1.4,
   bodySpheres: [[0.5, 0.5], [0.5, 1.2]],
   shake: 0,
   killCues: [
